@@ -7,6 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
   tailwind.config = {
@@ -335,12 +337,35 @@
 
   let nonFollowersData = [];
 
-  // ====== KONFIGURASI PAYWALL ======
-  // Kode akses statis. GANTI berkala supaya tidak terlalu mudah ditebak/dibagikan.
-  // CATATAN PENTING: karena web ini 100% client-side (tanpa server), kode ini
-  // SECARA TEKNIS bisa dilihat orang yang membuka "View Page Source". Sistem ini
-  // cocok untuk skala kecil/personal, bukan paywall tingkat enterprise.
-  const ACCESS_CODE = 'BUKA10';
+  // ====== KONFIGURASI PAYWALL (Firebase Firestore) ======
+  // Setiap kode akses sekarang UNIK dan tersimpan di Firestore dengan status
+  // used: true/false. Saat dipakai, status diubah jadi true lewat TRANSACTION
+  // (atomic), jadi tidak mungkin 2 orang berhasil pakai kode yang sama
+  // bersamaan walau mereka di device/browser berbeda — ini yang membuat
+  // sistem ini "one-time" secara GLOBAL, bukan cuma per-browser.
+  //
+  // GANTI nilai di bawah ini dengan config dari Firebase Console kamu:
+  // Project Settings → General → scroll ke "Your apps" → Firebase SDK snippet → Config
+  const firebaseConfig = {
+    apiKey: "AIzaSyBXJN0wrHdbkm1HSCgSTLZy5TLHMiIrFA4",
+    authDomain: "unfollowlens.firebaseapp.com",
+    projectId: "unfollowlens",
+    storageBucket: "unfollowlens.firebasestorage.app",
+    messagingSenderId: "502807293492",
+    appId: "1:502807293492:web:9aab6e757b1c477744e461"
+  };
+
+  let firestoreDb = null;
+  let firebaseReady = false;
+  try {
+    firebase.initializeApp(firebaseConfig);
+    firestoreDb = firebase.firestore();
+    firebaseReady = true;
+  } catch (err) {
+    console.error('[UnfollowLens] Firebase gagal diinisialisasi. Pastikan firebaseConfig sudah diisi dengan benar.', err);
+  }
+
+  const ACCESS_CODES_COLLECTION = 'accessCodes';
   const UNLOCK_STORAGE_KEY = 'unfollowlens_unlocked_v1';
   const FREE_PREVIEW_COUNT = 3; // jumlah baris yang tetap terlihat gratis
 
@@ -356,6 +381,42 @@
       .replace(/\s+/g, '')                       // semua spasi dihapus
       .toUpperCase()
       .trim();
+  }
+
+  /**
+   * Coba klaim kode akses lewat Firestore transaction.
+   * Return: { ok: true } kalau berhasil & kode jadi terpakai,
+   *         { ok: false, reason: 'not_found' | 'already_used' | 'offline' } kalau gagal.
+   *
+   * Pakai TRANSACTION (bukan get lalu set terpisah) supaya tidak ada celah
+   * race condition kalau dua orang submit kode yang sama persis bersamaan.
+   */
+  async function claimAccessCode(code){
+    if (!firebaseReady){
+      return { ok: false, reason: 'offline' };
+    }
+    const docRef = firestoreDb.collection(ACCESS_CODES_COLLECTION).doc(code);
+    try {
+      const result = await firestoreDb.runTransaction(async (tx) => {
+        const snap = await tx.get(docRef);
+        if (!snap.exists){
+          return { ok: false, reason: 'not_found' };
+        }
+        const data = snap.data();
+        if (data.used === true){
+          return { ok: false, reason: 'already_used' };
+        }
+        tx.update(docRef, {
+          used: true,
+          usedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        return { ok: true };
+      });
+      return result;
+    } catch (err) {
+      console.error('[UnfollowLens] Gagal menghubungi Firestore:', err);
+      return { ok: false, reason: 'offline' };
+    }
   }
 
   function isUnlocked(){
@@ -629,29 +690,52 @@
     URL.revokeObjectURL(url);
   });
 
-  $('unlockForm').addEventListener('submit', (e) => {
+  $('unlockForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const input = $('unlockInput');
+    const submitBtn = e.target.querySelector('button[type="submit"]');
     const value = normalizeCode(input.value);
-    const expected = normalizeCode(ACCESS_CODE);
     const unlockError = $('unlockError');
-    if (value === expected){
+
+    if (!value){
+      unlockError.textContent = 'Masukkan kode akses terlebih dahulu.';
+      unlockError.classList.remove('hidden');
+      return;
+    }
+
+    // Tampilkan status loading karena sekarang ada panggilan ke Firestore (async)
+    const originalBtnText = submitBtn.textContent;
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Memeriksa kode…';
+    unlockError.classList.add('hidden');
+
+    const result = await claimAccessCode(value);
+
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalBtnText;
+
+    if (result.ok){
       setUnlocked();
       unlockError.classList.add('hidden');
       updatePaywallVisibility();
       renderTable(nonFollowersData);
       window.scrollTo({ top: 0, behavior: 'smooth' });
-    } else {
-      unlockError.classList.remove('hidden');
-      const card = paywallCard;
-      card.classList.add('animate-shake');
-      setTimeout(() => card.classList.remove('animate-shake'), 400);
-      console.warn('[UnfollowLens] Kode tidak cocok.');
-      console.warn('[UnfollowLens] Yang diketik (setelah dibersihkan):', JSON.stringify(value));
-      console.warn('[UnfollowLens] Yang diharapkan (setelah dibersihkan):', JSON.stringify(expected));
-      console.warn('[UnfollowLens] Char codes diketik:', Array.from(value).map(c => c.charCodeAt(0)));
-      console.warn('[UnfollowLens] Char codes diharapkan:', Array.from(expected).map(c => c.charCodeAt(0)));
+      return;
     }
+
+    // Pesan error spesifik sesuai alasan kegagalan, supaya pengguna paham
+    // bedanya "kode salah" vs "kode sudah dipakai orang lain".
+    const messages = {
+      not_found: 'Kode akses tidak ditemukan. Periksa kembali kode yang kamu salin dari admin.',
+      already_used: 'Kode akses ini sudah pernah digunakan sebelumnya dan tidak bisa dipakai lagi. Hubungi admin kalau kamu yakin ini kesalahan.',
+      offline: 'Tidak bisa terhubung ke server verifikasi. Pastikan koneksi internet kamu aktif, lalu coba lagi.',
+    };
+    unlockError.textContent = messages[result.reason] || 'Kode tidak valid.';
+    unlockError.classList.remove('hidden');
+
+    const card = paywallCard;
+    card.classList.add('animate-shake');
+    setTimeout(() => card.classList.remove('animate-shake'), 400);
   });
 
   $('resetBtn').addEventListener('click', () => {
